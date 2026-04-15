@@ -87,6 +87,10 @@ func (s *UpdateStrategyDBMode) Update(ctx context.Context, targetContent Content
 		return mo.None[int](), fmt.Errorf("failed getting current state for %s: %w", s.client.BaseRootURL(), err)
 	}
 
+	if err := s.repopulateTargetsFromAdminAPI(ctx, cs); err != nil {
+		return mo.None[int](), err
+	}
+
 	ts, err := s.targetState(ctx, cs, targetContent.Content)
 	if err != nil {
 		return mo.None[int](), deckerrors.ConfigConflictError{Err: err}
@@ -237,6 +241,85 @@ func resourceErrorFromEntityAction(event diff.EntityAction) (ResourceError, erro
 	}
 
 	return parseRawResourceError(raw)
+}
+
+// repopulateTargetsFromAdminAPI replaces the targets section of currentState with what the Kong
+// Admin API actually reports for each upstream. This works around two related problems that
+// otherwise produce sustained HTTP 409 UNIQUE violations on target creates:
+//
+//  1. Pagination bug in go-database-reconciler's dump.GetAllTargets: the kong.ListOpt is
+//     initialised once before the upstream loop and gets mutated by pagination. After the first
+//     upstream that exceeds the page size (1000), every subsequent upstream is queried with a
+//     stale pagination cursor and silently loses targets from the dumped state.
+//  2. Untagged legacy targets: SelectorTags filtering excludes any pre-existing target that does
+//     not carry FilterTags (manual creation, prior KIC versions, etc.) so they never appear in
+//     currentState even though Kong's PostgreSQL still enforces UNIQUE(target, upstream_id) on
+//     them.
+//
+// In both cases, file.ingestTargets fails to find the existing target via
+// currentState.Targets.Get, assigns a fresh UUID, and emits a Create event that Kong rejects
+// with 409. Stale targets also pile up because the syncer never sees them in currentState and
+// therefore never emits Delete events for them.
+//
+// We sidestep both by issuing one client.Targets.ListAll call per upstream (kong-go's ListAll
+// allocates a fresh ListOpt and sets no Tags) and rebuilding currentState.Targets from the
+// authoritative response. The downstream syncer can then correctly emit Update/no-op events for
+// existing targets and Delete events for stale ones.
+func (s *UpdateStrategyDBMode) repopulateTargetsFromAdminAPI(ctx context.Context, currentState *state.KongState) error {
+	upstreams, err := currentState.Upstreams.GetAll()
+	if err != nil {
+		return fmt.Errorf("failed getting upstreams in current state for %s: %w", s.client.BaseRootURL(), err)
+	}
+
+	for _, u := range upstreams {
+		if u.ID == nil {
+			continue
+		}
+
+		liveTargets, err := s.client.Targets.ListAll(ctx, u.ID)
+		if err != nil {
+			// A single failed upstream listing should not abort the whole sync; degrade and
+			// continue. Targets for this upstream may still hit 409 this round, but the rest
+			// of the sync will proceed.
+			s.logger.Error(err, "failed to list targets from Kong Admin API for upstream",
+				"upstream_id", *u.ID)
+			continue
+		}
+
+		// Drop whatever the (possibly incomplete, possibly tag-filtered) dump produced for this
+		// upstream and replace it with the Admin API's authoritative list.
+		existing, err := currentState.Targets.GetAllByUpstreamID(*u.ID)
+		if err != nil && !errors.Is(err, state.ErrNotFound) {
+			return fmt.Errorf("failed listing current-state targets for upstream %s: %w", *u.ID, err)
+		}
+		for _, t := range existing {
+			if t.ID == nil {
+				continue
+			}
+			if delErr := currentState.Targets.Delete(*u.ID, *t.ID); delErr != nil &&
+				!errors.Is(delErr, state.ErrNotFound) {
+				return fmt.Errorf("failed pruning current-state target %s for upstream %s: %w",
+					*t.ID, *u.ID, delErr)
+			}
+		}
+
+		for _, t := range liveTargets {
+			if t == nil || t.ID == nil || t.Target == nil {
+				continue
+			}
+			// Ensure the Upstream pointer is set; ListAll may omit it since the upstream is in
+			// the URL.
+			if t.Upstream == nil {
+				t.Upstream = &kong.Upstream{ID: u.ID}
+			}
+			if addErr := currentState.Targets.Add(state.Target{Target: *t}); addErr != nil {
+				return fmt.Errorf("failed inserting target %s for upstream %s into current state: %w",
+					*t.Target, *u.ID, addErr)
+			}
+		}
+	}
+
+	return nil
 }
 
 func (s *UpdateStrategyDBMode) MetricsProtocol() metrics.Protocol {
